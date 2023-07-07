@@ -1,0 +1,356 @@
+After watching this excellent [lesson](https://youtu.be/K18LzGharGM) in Solidity and Inline assembly by the Ethereum Engineering Group, I decided to convert my notes into an article and publish it for posterity. Please [DM me](https://twitter.com/0xProtosec) to highlight any suggestions or mistakes in the text. 
+
+### Introduction
+
+We can write smart contracts in four major ways:
+
+1.  Plain Solidity
+2.  Solidity w/ inline assembly sprinkled in
+3.  Yul (low level language w/ inline opcodes
+4.  Bytecode (plain opcodes)
+    
+
+However, why would we need to choose something other than plain solidity? For two main reasons:
+
+1.  Do things that are impossible to do with plain solidity.
+2.  Do things in a more gas efficient way.
+    
+
+Let's look at the use cases when we need to write more than just Solidity.
+
+## Solidity + inline assembly
+
+### Storage Slots
+
+By default, solidity will choose storage slots sequentially and automatically for us. We cannot choose a particular slot to store in with plain Solidity. For this, we need to use inline assembly:
+
+```
+bytes32 internal constant _IMPLEMENTATION_SLOT = 
+0x36089...82bb0;
+
+constructor (address _implementation) {
+assembly {
+sstore(_IMPLEMENTATION_SLOT, _implementation)
+  }
+}
+
+```
+
+When we are working with proxies, we don't want the storage slots used in proxy contracts to clash with those used in the implementation contracts. To this end, we use inline assembly to store the implementation address to a particular, distant storage slot.
+
+### Return Raw Data
+
+In solidity, whenever a function returns a value, it has to be in a particular type. What if we want to return the value as-is, without casting it into any type? We can use inline assembly to return the value to caller as-is:
+
+```
+    fallback() external payable {
+        assembly {
+            // load addr to target stack variable
+            let target := sload(_IMPLEMENTATION_SLOT) 
+            // copy incoming calldata data to memory
+            calldatacopy(0, 0, calldatasize()) 
+            // make delegate call
+            let result := delegatecall(gas(), target, 0, calldatasize(), 0, 0)
+            // copy return data to memory 
+            returndatacopy(0, 0, returndatasize)
+            // open a switch board for result 
+            switch result 
+            // is res is 0, revert and return returndata as message
+            case 0 {
+                revert(0, returndatasize())
+            } 
+            // otherwise return returndata to caller
+            default {
+                return(0, returndatasize())
+            } 
+            // The data returned is from mem offset 0 until returndatasize()
+        }
+    }
+```
+
+### Efficient Memory Use
+
+In memory space, byte `00` to byte `63` (so 64 bytes) is scratch space, which is used when hashing. While byte `64` to `95` (32 bytes) is the free memory pointer. These 32 bytes are never deallocated from the free memory pointer. In the previous example, we are saving gas on memory expansion by using memory from 0th byte, thereby utilising the scratch pad space for our purposes.
+
+### Efficient Extraction of Fields
+
+Suppose we have encoded some uint256 values into `bytes` using `abi.encode`. Now, We want to extract values from this bytes array. For example, we can have a `bytes` array which has 5 uint256 values. We can extract the individual values using `abi.decode`. In the example below, we are extracting the last value from the byte array and storing it in the variable `val`:
+
+```
+function extract1(bytes calldata _stuff) external pure {
+    (, , , , uint256 val) = abi.decode
+        (_stuff, (uint256, uint256, uint256, uint256, uint256));
+}
+```
+
+However, this extracts all the values but only stores one in the val variable. This operation costs 52482 gas. 
+
+Now, lets considering extracting the value using inline assembly:
+
+```
+function extract2(bytes calldata _stuff) external (
+val = bytesToUint256(_stuff, 32*4);
+)
+
+function bytesToUint256(bytes memory _b, uint256 _startOffset) internal pure returns (uint256) {
+require(_b.length >= _startOffset + 32, "slicing out of range");
+uint256 x;
+assembly {
+x :=  mload(add(_b, add(32, _startOffset)))
+}
+return x;
+}
+```
+
+This operation extracts the 5th `uint` value, which starts at the offset `32 x 4`, so after the first four memory slots. This is the `_startOffset`. 
+
+First, it is ensured that the byte array length is more than the offset + the size for the value we want to read, in this case 32 bytes for `uint256`. Then, we add 32 to `_startOffset` (which is 32 x 4), and then add this new number to the `_stuff` bytes array itself. Finally, we load whatever data is here, which is the 5th `uint256`.
+
+### Parsing non-ABI Encoded Data
+
+Sometimes we get data that is not ABI encoded, and so we cannot use `abi.decode`. This type of situation is usually encountered with bridge protocols, where encoded data from various chains is incoming, not just EVM. As such, assembly has to be used to manually tease out and decode the encoded values.
+
+```
+// Parse Signatures
+uint256 signersLen = encodedVM.toUint8(index);
+index += 1;
+vm.signatures = new Structs.Signature[](signersLen);
+for (uint i=0; i<signersLen; i++>) {
+vm.signatures[i].guardianIndex = encodedVM.toUint8(index);
+index += 1;
+
+vm.signatures[i].r = encodedVM.toBytes32(index);
+index +=32;
+vm.signatures[i].s = encodedVM.toBytes32(index);
+index +=32;
+vm.signatures[i].v = encodedVM.toUint8(index) + 27;
+index +=1;
+
+}
+```
+
+In the code above (a snippet from the Wormhole bridge codebase), since the signatures are not ABI encoded, the signature elements, the `guardianIndex`, and r, s, v values are teased out manually. The functions `toUint8` and `toBytes32` perform a similar operation as in the earlier code block whereby the value is teased out by going to a particular offset and loading that value onto memory.
+
+## Yul
+
+Sometimes, we can write the whole contract in assembly. There were certain design goals of Yul Developers:
+1. Yul programs should be readable, even if code is generated by solc or any other high level language compiler.
+2. Control flow should be easy to understand to help in manual inspection, formal verification and optimization
+3. The translation from Yul to bytecode should be as straightforward as possible.
+4. Yul should be suitable for whole-program optimization. (this would help alot with locating extra gas usage in operations such as abi.decode).
+
+So given the design goals, we have in Yul:
+1. High level constructs such as for loops, if and switch statements, and function calls.
+2. No control flow and stack manipulation opcodes such as SWAP, DUP, JUMPDEST, JUMP and JUMPI
+
+However, we can implement our own bytecode in the middle of the code. This can be done using `verbatim`.
+
+```
+let x:= calldataload(0) // Load a word starting from 0th byte of calldata onto the stack
+let double := verbatim_1i_1o(hex"600202", x)
+```
+In the above code, `1i` means 1 input, so 1 word/ slot will be popped off the stack and taken as input. `1o` means nothing will be pushed onto the stack (so no output). The opcodes to be used are `hex"600202"` and finally the input itself will be `x`, which we loaded onto the stack using `calldataload`.
+
+This is helpful when, for example, we are working with an EVM version with a new opcode not supported in Ethereum, we can use verbatim. One example could be when Yul didn't support returning chainId, we could have written a verbatim instruction to return the chain id.
+
+
+
+### Yul Code
+
+We've got different code sections in a Yul smart contract. Generally, there are 2: 
+1. Init Code (constructor; part of deployment payload but not stored on chain)
+2. Runtime Code (code that is deployed)
+
+```
+object "BuggyProxy" {
+// `code` contains contract initcode
+	code {
+		...DO STUFF HERE...
+		   return(0, datasize("runtime"))
+	}
+	// `runtime` contains object bytecode (stored on chain)
+	object "runtime" {
+		   code {
+			 ...DO STUFF HERE...
+		}
+    }
+}
+```
+
+In Solidity, it would look like this: (We go over a buggy proxy; Note that this proxy assumes that the upgrade logic is in the implementation contract, a la UUPS)
+
+```
+contract BuggyProxy {
+	address public implementation;
+		
+	constructor(address _impl) {
+			implementation = _impl;
+	}
+		
+	fallback() external payable {
+		(bool ok, bytes memory res) = implementation.delegatecall(msg.data);
+		require(ok, "Delegatecall Failed!");
+	}
+}
+```
+
+There are two issues with this proxy, one critical and one low:
+1. The implementation address is stored in slot 0 of the proxy contract. Since the implementation contract will define its own variables, which will then get stored sequentially in the proxy contract's storage, slot 0 will get overwritten. As such, any subsequent calls will most likely fail if the value stored in slot 0 is not an address. If it is an address, the calls will instead be made to that random address, whatever it may be.
+2. The lesser issue is that there is no error message propagation. If the delegatecall to the `implementation` is to fail for some reason, only "delegatecall failed" will be used as revert message. Instead, the returned `res` bytes should be returned to user so that the error message may be examined.
+
+Now, lets look at a proxy contract with inline assembly:
+
+```
+contract ProxyGetImpl {
+    constructor(address _implementation) {
+        assembly {
+            sstore(address(), _implementation)
+        }
+    }
+
+    function PROXY_getImplementation()
+        public
+        view
+        returns (address implementation)
+    {
+        assembly {
+            implementation := sload(address())
+        }
+    }
+
+    fallback() external payable {
+         assembly {
+            // Load the storage slot defined by the address
+            let target: sload(address())
+            // Copy calldata to mem location 0
+            calldatacopy(0, 0, calldatasize())
+            // Make a delegate call to target, passing the gas and calldata
+            let result := delegatecall(gas(), target, 0, calldatasize(), 0, 0)
+            // Copy returndata to mem location 0
+            returndatacopy(0,0,returndatasize())
+            // Return or revert based on success
+            switch result
+                case 0 {revert(0, returndatasize())}
+                default {return (0, returndatasize())}
+        }
+    }
+}
+
+```
+
+The constructor receives an implementation address as argument. Then it uses `sstore` to store the implementation address at a storage location equal to the address of the proxy contract. So, its a pretty distant and random storage slot. This way, chances of storage collision are minimised. There are gas savings due to this as well, as `address()` is 1 opcode; if we would have read some address/ storage location i.e., used `sload` then that would have cost more.
+
+In the `PROXY_getImplementation()` function, whatever is stored at `address()` storage slot is first loaded onto the stack variable `implementation` and then returned to the caller.
+
+In the fallback, we are first loading the implementation address from its storage slot which is `address()`. Then, we copy to memory, starting at byte 0 (so we overwrite the scratch space) and from byte offset 0 (i.e., the beginning) the calldata sent with this call, then, we make a delegatecall to the implementation contract, passing along the calldata that is present in memory. We also pass `0` as returndata length because if returndata exceeds this length, it will ask for more memory.
+
+Then, we copy the return data to memory, again overwriting the scratch space. Finally, if the call failed and result has `0`, we revert with data stored in memory from 0th byte until the size of the return data. In other words, we return the returndata. If the call was a success, we instead return the returndata.
+
+## EVM Init Code/ Constructor
+
+When we deploy a contract, the data payload for this transaction has the initcode, the runtime code and ABI encoded params. For the initcode, there is no calldata. The return value of the init code must return the mem offset of the runtime code (code that is to be deployed) and length of the byte code to deploy.
+
+Let's see how the constructor would look in YUL:
+
+```
+datacopy(returndatasize(),
+dataoffset("runtime"), 
+add(datasize("runtime"), 32)
+
+OR
+
+datacopy(returndatasize(), dataoffset("runtime"), 0x54)
+let implAddress := mload(datasize("runtime"))
+sstore(address(), implAddress)
+
+return(returndatasize(), datasize("runtime"))
+```
+
+The above code copies to memory the runtime code + the parameter which is the address to deploy to. Yul doesn't support constant addition so the add statement is not allowed, it's just there for example.
+
+`datacopy` works just like `codecopy`; since Yul has been designed with EWASM and EVM in mind, `datacopy` has been used.
+
+A quick recap of codecopy. `codecopy(t, f, s)`: Copy `s` bytes from code at position `f` to mem offset `t`. Here, `returndatasize` is used to load `0` onto the stack since we want to store at the beginning of memory.
+
+`returndatasize` opcode returns 0 if a `call` has not yet been made, after which it returns the length of the calldata due to the previous`call`. This has been used as a way to load 0 onto the stack with a single opcode and low gas. However, `PUSH0` opcode has now been introduced in the Shanghai fork (Solidity version 0.8.20), so we don't have to use this work around anymore.
+
+After copying runtimecode and impl addr to memory (which is stored right after the rintime code, which is stored starting at memoffset 0), we load the implAddress onto the stack. The implAddress starts at datasize of the runtime code i.e., right after it. Then, we `sstore` the impl address from memory to the storage at the storage slot that is `address()`. Finally, return the runtime code (the runtime object in Yul); `returndatasize()` returns 0, and `datasize("runtime")` is how many bytes after 0x00 are to be returned.
+
+The contract is now deployed.
+
+## EVM Runtime Code/ Contract Code
+
+For the runtime code, the `calldata` is the function selector followed by ABI encoded params. The execution will occur and stop when one of the following is encountered:
+1. STOP
+2. INVALID
+3. SELFDESTRUCT(address)
+4. REVERT(memoffset, length of error value)
+5. RETURN(memoffset, length of return value)
+
+We shall now do the above in code.
+
+```
+// First, shift right by 224 bits (so only first 4 bytes of calldata remain)
+let selector := shr(224, calldataload(returndatasize()))
+
+if eq(selector, 0x90611127) /*"PROXY_getImplementation()"*/ {
+		let impl := sload(address())
+		mstore(returndatasize(), impl)
+		return(returndatasize(), 0x20)
+}
+
+// Copy all calldata, from 0, and load to memory at 0
+calldatacopy(returndatasize(), returndatasize(), calldatasize())
+
+// Load 0 onto stack, to be used later
+let zero := returndatasize()
+
+let success := delegatecall(gas(), sload(address()), returndatasize(), calldatasize(), returndatasize(), returndatasize())
+
+// Copy return data back to memoffset 0
+//returndatacopy(t, f, s) => copy a bytes from return data at offset f to mem offset t
+returndatacopy(zero, zero, returndatasize())
+
+// If delegate call failed, revert with te error data
+if iszero(success) {
+		revert (zero, returndatasize())
+}
+// If call successful, return returndata
+return (zero, returndatasize())
+```
+
+When we shift the calldata right by 224 bits the calldata (total 256 bits/ 32 bytes), leaving the first 4 bytes, the rest of the bits are discarded. Then, we check if the selector matches the selector of the implementation address, if it does, load the impl address onto the stack. Afterward, store it at 0 in memory via `mstore`, finally return 32 bytes (`0x20`) starting from 0x00 in memory, the impl address is then returned. Note how `returndatasize` is used to push `0` onto the stack since Yul does not support literals.
+
+Next, we copy entire calldata to memory. Then, we make the delegatecall to the implementation address; the address is loaded from storage, the calldata is sent forth, and we specify that we don't need any return data returned. This is done by using 0 for return data offset and then 0 again for returndata size.
+ 
+ ## Gas savings with Yul and Bytecode
+ 
+The major savings are when deploying code to EVM. So what is the use case? why go to so much pain to write yul?
+ 
+### Use Cases and Misc:
+Imagine we have user wallets for account abstraction. For each user, a separate wallet contract needs to be deployed. We can instead deploy a minimal proxy contract written in Yul and for the user a single implementation contract. We did this because implementation contracts can become very large.
+
+There is a tradeoff here, delegatecall is made at each user call which is more expensive. However, then it does allow us to have upgradeable contracts as is necessary in account abstraction.
+ 
+ ## The Yul `revert`
+ 
+ The yul function `revert(returnDataOffset, returnDataSize )` takes 2 args: `add(returnData, 32)` and `returnData`. So, the 1st arg should be the offset of return data from where to return, and the 2nd arg should be the size of the return data.
+ E.g., `revert(add(returnData, 32), returnDataSize)`. Here, we move to the end of return data and add 32, then pass in the size of the data to return. This is different from the Solidity `revert`.  
+ 
+ ### `msg.sender` when transferring tokens (or doing anything else)
+ 
+ Suppose we have an ERC20 contract, which also holds its own tokens as balance. If a user calls a function of this contract which has the following line:
+ 
+ `transfer(address(recipient), amount),`
+ 
+ The tokens transferred will be that of the EOA caller! This is because msg.sender will be the caller for the ERC20 contract being inherited.
+ 
+ However, if we make a call like this:
+ 
+ `IERC20(address(this)).transfer(address(recipient), amount),`
+ 
+ The msg.sender will become the token contract itself. It will make an external call to itself and become the msg.sender.
+ 
+ ### Further Reading
+ 
+- https://youtu.be/K18LzGharGM ("Solidity Inline Assembly & Yul", by the Ethereum Engineering Group)
